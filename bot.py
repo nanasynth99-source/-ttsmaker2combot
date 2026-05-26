@@ -1,6 +1,7 @@
 import os
 import logging
 import requests
+import time
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
@@ -10,60 +11,92 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Fetch secret keys securely from environment variables
+# Fetch secret keys securely from Render Environment Variables
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-TTSMAKER_API_KEY = os.environ.get("TTSMAKER_API_KEY")
-
-DEFAULT_VOICE_ID = 777  # Standard English voice ID example
-DEFAULT_LANGUAGE = "en" 
+# Using Replicate API for image upscaling (Sign up at replicate.com to get a token)
+REPLICATE_API_TOKEN = os.environ.get("REPLICATE_API_TOKEN") 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "👋 Welcome to the TTSMaker Bot!\n\n"
-        "Send me any text, and I will convert it into an AI voice using TTSMaker."
+        "🖼️ Welcome to the AI Image Upscaler Bot!\n\n"
+        "Send me any low-resolution image, and I will upscale it to high-definition for you."
     )
 
-async def handle_tts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text_to_convert = update.message.text
-    status_message = await update.message.reply_text("⏳ Synthesizing voice... please wait.")
+async def upscale_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Check if a photo was sent
+    if not update.message.photo:
+        await update.message.reply_text("Please send an actual image file.")
+        return
 
-    api_url = "https://api.ttsmaker.com/v2/create-tts-order"
+    status_message = await update.message.reply_text("⏳ Downloading your image...")
+
+    # 1. Get the highest resolution version of the photo sent by the user
+    photo_file = await update.message.photo[-1].get_file()
+    photo_url = photo_file.file_path # Direct URL to the image on Telegram's servers
+
+    await status_message.edit_text("🪄 Upscaling image using AI... this may take a few seconds.")
+
+    # 2. Call Replicate API (Real-ESRGAN model for upscaling)
+    # Model: stability-ai/real-esrgan
+    replicate_url = "https://api.replicate.com/v1/predictions"
+    headers = {
+        "Authorization": f"Token {REPLICATE_API_TOKEN}",
+        "Content-Type": "application/json"
+    }
     payload = {
-        "api_key": TTSMAKER_API_KEY,
-        "text": text_to_convert,
-        "voice_id": DEFAULT_VOICE_ID,
-        "language": DEFAULT_LANGUAGE,
-        "audio_format": "mp3",
-        "speed": 1.0,
-        "volume": 1.0
+        "version": "724340e36656bd18d0af74b34b97089ccf8e79e5b7468132cb071db8c1056f70",
+        "input": {
+            "image": photo_url,
+            "scale": 4, # Upscale by 4x
+            "face_enhance": True
+        }
     }
 
     try:
-        response = requests.post(api_url, json=payload, timeout=30)
-        data = response.json()
+        # Start prediction
+        response = requests.post(replicate_url, json=payload, headers=headers, timeout=20)
+        prediction = response.json()
+        
+        if "id" not in prediction:
+            await status_message.edit_text("❌ AI Upscaling failed. Please check API configuration.")
+            return
 
-        if str(data.get("error_code")) == "0":
-            audio_url = data["audio_file_url"]
-            await update.message.reply_audio(audio=audio_url, caption="🎵 Generated via TTSMaker")
-            await status_message.delete()
-        else:
-            error_msg = data.get("error_summary", "Unknown API Error")
-            await status_message.edit_text(f"❌ TTSMaker Error: {error_msg}")
+        prediction_id = prediction["id"]
+        status_url = f"{replicate_url}/{prediction_id}"
+
+        # 3. Poll the API until the upscaling is finished
+        while True:
+            status_check = requests.get(status_url, headers=headers, timeout=10).json()
+            status = status_check.get("status")
+
+            if status == "succeeded":
+                output_url = status_check["output"]
+                await status_message.edit_text("📤 Sending your upscaled image...")
+                # Send the final upscaled image back to user
+                await update.message.reply_photo(photo=output_url, caption="✅ Here is your 4x upscaled image!")
+                await status_message.delete()
+                break
+            elif status == "failed":
+                await status_message.edit_text("❌ Upscaling failed on the AI server.")
+                break
+            
+            time.sleep(2) # Wait 2 seconds before checking status again
 
     except Exception as e:
-        logger.error(f"Error during TTS processing: {e}")
-        await status_message.edit_text("❌ Something went wrong while generating the audio.")
+        logger.error(f"Error during upscaling: {e}")
+        await status_message.edit_text("❌ An error occurred while processing your image.")
 
 def main() -> None:
-    if not TELEGRAM_TOKEN or not TTSMAKER_API_KEY:
+    if not TELEGRAM_TOKEN or not REPLICATE_API_TOKEN:
         logger.critical("Missing Environment Variables! Check Render configuration.")
         return
 
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_tts))
+    # Listen for photos instead of text
+    application.add_handler(MessageHandler(filters.PHOTO, upscale_image))
 
-    print("Bot is starting up...")
+    print("Image Upscaler Bot is starting up...")
     application.run_polling()
 
 if __name__ == '__main__':
